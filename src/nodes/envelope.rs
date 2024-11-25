@@ -1,18 +1,6 @@
-mod osc;
+use std::{any::Any, mem};
 
-pub use osc::{Osc, Wave};
-
-pub trait Sound : Send {
-    fn tick(&mut self) -> f32;
-    fn start(&mut self);
-    fn stop(&mut self);
-    fn connect(&mut self, dest: Box<dyn Effect>) -> &mut Box<dyn Effect>;
-    fn disconnect(&mut self) -> Option<Box<dyn Effect>>;
-}
-
-pub trait Effect : Sound {
-    fn process(&mut self, sample: f32) -> f32;
-}
+use super::{into_input, Input, InputSlot, Node};
 
 pub enum EnvelopeState {
     Idle,
@@ -22,71 +10,59 @@ pub enum EnvelopeState {
     Release(f32),
 }
 pub struct Envelope {
-    effect: Option<Box<dyn Effect>>,
-    last_val: f32,
+    input: Input<f32>,
+    level: f32,
     ticks: u32,
     state: EnvelopeState,
 
     attack_samps: u32,
     decay_samps: u32,
     sustain: f32,
-    release_samps: u32
+    release_samps: u32,
 }
 
 impl Envelope {
-    pub fn new(rate: u32, attack: f32, decay: f32, sustain: f32, release: f32) -> Self {
-        return Envelope {
+    pub fn new(rate: u32, attack: f32, decay: f32, sustain: f32, release: f32) -> Box<Self> {
+        let obj = Envelope {
+            input: Input::Value(0.0),
+            level: 0.0,
             ticks: 0,
             state: EnvelopeState::Idle,
-            last_val: 0.0,
+
             sustain,
             attack_samps: (attack * rate as f32) as u32,
             decay_samps: (decay * rate as f32) as u32,
             release_samps: (release * rate as f32) as u32,
-            effect: None
         };
+
+        Box::new(obj)
     }
 }
 
-impl Effect for Envelope {
-    fn process(&mut self, sample: f32) -> f32 {
-        let val = self.tick();
-        sample * val
-    }
-}
-
-impl Sound for Envelope {
-    fn connect(&mut self, dest: Box<dyn Effect>) -> &mut Box<dyn Effect> {
-        self.effect = Some(dest);
-        return self.effect.as_mut().unwrap();
-    }
-
-    fn disconnect(&mut self) -> Option<Box<dyn Effect>> {
-        self.effect.take()
-    }
-
-    fn start(&mut self) {
-        if let Some(effect) = self.effect.as_mut() {
-            effect.start();
+impl Node<f32> for Envelope {
+    fn press(&mut self) {
+        if let Input::Node(node) = &mut self.input {
+            node.press();
         }
 
         self.ticks = 0;
-        self.state = EnvelopeState::Attack(self.last_val);
+        self.state = EnvelopeState::Attack(self.level);
     }
 
-    fn stop(&mut self) {
-        if let Some(effect) = self.effect.as_mut() {
-            effect.stop();
-        }
-
+    fn release(&mut self) {
         self.ticks = 0;
-        self.state = EnvelopeState::Release(self.last_val);
+        self.state = EnvelopeState::Release(self.level);
     }
 
     fn tick(&mut self) -> f32 {
         let val = match self.state {
             EnvelopeState::Idle => {
                 self.ticks = 0;
+
+                if let Input::Node(node) = &mut self.input {
+                    node.release();
+                }
+
                 0.0
             }
             EnvelopeState::Attack(start_val) => {
@@ -130,8 +106,30 @@ impl Sound for Envelope {
             }
         };
 
-        self.last_val = val;
+        self.level = val;
 
-        return val;
+        let sample: f32 = self.input.value().try_into().unwrap();
+        return sample * self.level;
+    }
+
+    fn get_input(&mut self, slot: InputSlot) -> Result<&mut dyn Any, ()> {
+        match slot {
+            InputSlot::Input => Ok(&mut self.input),
+            _ => Err(()),
+        }
+    }
+
+    fn set_input(&mut self, input: Box<dyn Any>, slot: InputSlot) -> Result<Box<dyn Any>, ()> {
+        match slot {
+            InputSlot::Input => {
+                let input = match into_input(input) {
+                    Ok(input) => input,
+                    Err(_) => return Err(()),
+                };
+
+                Ok(Box::new(mem::replace(&mut self.input, input)))
+            }
+            _ => Err(()),
+        }
     }
 }
