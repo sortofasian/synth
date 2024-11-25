@@ -1,272 +1,186 @@
-use std::{f32::consts::PI, fs::File, i16};
+mod synth;
+mod effect;
 
-const filter: &[f32] = &[
-    0.023763740696978130,
-    0.028369892700470929,
-    0.032882947824167799,
-    0.037213760056038943,
-    0.041275300351152427,
-    0.044984789636795010,
-    0.048265744317032462,
-    0.051049878768686600,
-    0.053278812980215293,
-    0.054905538635897727,
-    0.055895603445089231,
-    0.056227981174950710,
-    0.055895603445089231,
-    0.054905538635897727,
-    0.053278812980215293,
-    0.051049878768686600,
-    0.048265744317032462,
-    0.044984789636795010,
-    0.041275300351152427,
-    0.037213760056038943,
-    0.032882947824167799,
-    0.028369892700470929,
-    0.023763740696978130,
-];
+use std::{collections::HashMap, f32::consts::SQRT_2, io, ops::Add, sync::mpsc::{self, channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError}, thread};
 
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    FromSample, SampleRate, SizedSample,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::{prelude::CrosstermBackend, style::Stylize, widgets::Paragraph, DefaultTerminal, Frame, Terminal};
+use rodio::{OutputStream, Source};
+use synth::{Envelope, Osc, Sound, Wave};
 
 fn main() {
-    let device = cpal::default_host().default_output_device().unwrap();
+    let mut terminal = ratatui::init();    
+    terminal.clear().unwrap();
 
-    let config = device.default_output_config().unwrap();
+    let mut app = App::new();
 
-    match config.sample_format() {
-        cpal::SampleFormat::I8 => make_stream::<i8>(device, config.into()),
-        cpal::SampleFormat::U8 => make_stream::<u8>(device, config.into()),
-        cpal::SampleFormat::I16 => make_stream::<i16>(device, config.into()),
-        cpal::SampleFormat::U16 => make_stream::<u16>(device, config.into()),
-        cpal::SampleFormat::I32 => make_stream::<i32>(device, config.into()),
-        cpal::SampleFormat::U32 => make_stream::<u32>(device, config.into()),
-        cpal::SampleFormat::I64 => make_stream::<i64>(device, config.into()),
-        cpal::SampleFormat::U64 => make_stream::<u64>(device, config.into()),
-        cpal::SampleFormat::F32 => make_stream::<f32>(device, config.into()),
-        cpal::SampleFormat::F64 => make_stream::<f64>(device, config.into()),
-        _ => panic!(),
+    app.run(&mut terminal).unwrap();
+
+    ratatui::restore();
+}
+
+
+pub struct App {
+    counter: u8,
+    exit: bool,
+}
+
+impl App {
+    fn new() -> Self {
+        let app = App {
+            counter: 0,
+            exit: false,
+        };
+
+
+        return app;
+    }
+
+    /// runs the application's main loop until the user quits
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<SynthCommand>();
+        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+        let synth = Test::new(rx);
+        stream_handle.play_raw(synth.convert_samples()).unwrap_or(());
+
+        while !self.exit {
+            //terminal.draw(|frame| self.draw(frame))?;
+            self.handle_events(&tx)?;
+        }
+        Ok(())
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        let counter = self.counter;
+        let string = format!("Hello! Counter is {counter}");
+        let greeting = Paragraph::new(string)
+            .white()
+            .on_blue();
+        frame.render_widget(greeting, frame.area());
+    }
+
+    fn handle_events(&mut self, tx: &Sender<SynthCommand>) -> io::Result<()> {
+        match event::read().unwrap() {
+            Event::Key(key) => {
+                fn send_freq(f: usize, key: &KeyEvent, tx: &Sender<SynthCommand>) {
+                    match key.kind {
+                        KeyEventKind::Press => {tx.send((f, true)).unwrap()}
+                        KeyEventKind::Release => {tx.send((f, false)).unwrap()}
+                        _ => {}
+                    }
+                }
+
+                match key.code {
+                    KeyCode::Esc => {self.exit = true}
+                    KeyCode::Char('a') => send_freq(1, &key, tx), // a
+                    KeyCode::Char('w') => send_freq(2, &key, tx), // a#
+                    KeyCode::Char('s') => send_freq(3, &key, tx), // b
+                    KeyCode::Char('d') => send_freq(4, &key, tx), // c
+                    KeyCode::Char('r') => send_freq(5, &key, tx), // c#
+                    KeyCode::Char('f') => send_freq(6, &key, tx), // d
+                    KeyCode::Char('t') => send_freq(7, &key, tx), // d#
+                    KeyCode::Char('g') => send_freq(8, &key, tx), // e
+                    KeyCode::Char('h') => send_freq(9, &key, tx), // f
+                    KeyCode::Char('u') => send_freq(10, &key, tx), // f#
+                    KeyCode::Char('j') => send_freq(11, &key, tx), // g
+                    KeyCode::Char('i') => send_freq(12, &key, tx), // g#
+                    KeyCode::Char('k') => send_freq(13, &key, tx), // a
+                    KeyCode::Up => send_freq(100, &key, tx),
+                    KeyCode::Down => send_freq(101, &key, tx),
+                    KeyCode::Left => send_freq(102, &key, tx),
+                    KeyCode::Right => send_freq(103, &key, tx),
+                    _ => {}
+                }
+
+                return Ok(())
+            }
+            _ => return Ok(())
+        };
     }
 }
 
-fn make_stream<T>(device: cpal::Device, config: cpal::StreamConfig)
-where
-    T: SizedSample + FromSample<f32>,
-{
-    let mut osc = Sine::new(config.sample_rate.0, 440.0);
-    let mut lfo = Sine::new(config.sample_rate.0, 40.0);
-    let mut env = Envelope::new(config.sample_rate.0, 0.01, 0.06, 0.6, 0.7);
-    let rate = config.sample_rate.0;
-    let press_ticks = (rate as f32 * 0.1) as u32;
-    let measure_samps = rate;
-    let quarter_samps = (measure_samps as f32 * 0.33) as u32;
-    let mut ticks = 0;
-    let mut sounds = vec![0.0; filter.len()];
+type SynthCommand = (usize, bool);
 
-    let mut file = File::open("./guitar.wav").unwrap();
-    let (header, data) = wav::read(&mut file).unwrap();
-    let mut sample = data.try_into_sixteen().unwrap();
-    println!("{header:#?}");
-    let max_val = sample.iter().cloned().fold(0, i16::max) as f32 / i16::MAX as f32;
+struct Test {
+    trigger: Receiver<SynthCommand>,
+    sounds: HashMap<usize, Box<dyn Sound>>,
+    wave: Wave
+}
 
-    let stream = device
-        .build_output_stream(
-            &config,
-            move |output: &mut [T], _| {
-                for frame in output.chunks_mut(config.channels.into()) {
-                    if ticks % measure_samps == 0 {
-                        osc.freq = 440.0;
-                        env.press();
-                    }
+impl Test {
+    fn new(rx: Receiver<SynthCommand>) -> Self {
+        return Self {
+            trigger: rx,
+            sounds: HashMap::new(),
+            wave: Wave::Sine
+        }
+    }
+}
 
-                    /*
-                    if (ticks - press_ticks) % measure_samps == 0 {
-                        env.release();
-                    }
+impl Iterator for Test {
+    type Item = f32;
 
+    fn next(&mut self) -> Option<Self::Item> {
+        //let base = 440.0 * (2.0 as f32).powf(1.0 / 12.0).powi(21); // mc donalds
+        // let base = 440.0 * (2.0 as f32).powf(1.0 / 12.0).powi(16); // harry potter
+        let base = 440.0 * (2.0 as f32).powf(1.0 / 12.0).powi(10); // omni man
+        // let base = 440.0 * (2.0 as f32).powf(1.0 / 12.0).powi(8); // C
+        fn semitones(freq: f32, n: usize) -> f32 {
+            let factor = (2.0 as f32).powf(1.0/12.0);
+            freq * factor.powi(n as i32)
+        }
 
-                    if (ticks - quarter_samps) % measure_samps == 0 {
-                        osc.freq = 440.0 * (2.0 as f32).powf(1.0 / 12.0).powi(5);
-                        env.press();
-                    }
-                    if (ticks - press_ticks - quarter_samps) % measure_samps == 0 {
-                        env.release();
-                    }
-                    */
+        match self.trigger.try_recv() {
+            Ok((100, _)) => self.wave = Wave::Sine,
+            Ok((101, _)) => self.wave = Wave::Saw,
+            Ok((102, _)) => self.wave = Wave::Square,
+            Ok((103, _)) => self.wave = Wave::Triangle,
 
-                    /*
-                    if (ticks - (quarter_samps * 2)) % measure_samps == 0 {
-                        osc.freq = 440.0 * (2.0 as f32).powf(1.0 / 12.0).powi(8);
-                        env.press();
-                    }
-                    if (ticks - press_ticks - (quarter_samps * 2)) % measure_samps == 0 {
-                        env.release();
-                    }
-                    */
-
-                    ticks += 1;
-
-                    // sine
-                    let mut sound = osc.tick();
-
-                    // envelope
-                    // sound *= env.tick();
-
-                    //let sound = sound * (1.0 - (lfo.tick() / 5.0));
-                    sound *= 0.2;
-
-                    sound = match sample.get((ticks as f32) as usize) {
-                        Some(s) => *s as f32 / i16::MAX as f32,
-                        None => 0.0,
-                    };
-
-                    // sound = if 0.001 < sound { sound } else { 0.0 };
-                    sound = sound.powi(3) * 3.0;
-
-                    sound = (sound + sounds.last().unwrap()) / 2.0;
-                    sounds.push(sound);
-
-                    let value = T::from_sample(sound);
-                    for sample in frame.iter_mut() {
-                        *sample = value
-                    }
+            Ok((key, false)) => {
+                if let Some(sound) = self.sounds.get_mut(&key) {
+                    (*sound).stop()
                 }
             },
-            |_| panic!(),
-            None,
-        )
-        .unwrap();
-
-    stream.play().unwrap();
-    loop {}
-}
-
-struct Sine {
-    rate: u32,
-    ticks: u32,
-    freq: f32,
-}
-
-impl Sine {
-    fn new(rate: u32, freq: f32) -> Self {
-        Sine {
-            rate,
-            ticks: 0,
-            freq,
-        }
-    }
-
-    fn tick(&mut self) -> f32 {
-        if self.freq < 1.0 {
-            if (self.ticks as f32 / self.rate as f32) >= (1.0 / self.freq) {
-                self.ticks = 0;
-            }
-        } else if self.ticks == self.rate {
-            self.ticks = 0;
+            Ok((key, true)) => {
+                /*if let Some(x) = self.sounds.get_mut(&key) {
+                    x.wave = self.wave;
+                    x.start()
+                } else {
+                 */
+                    let mut osc = Osc::new(self.sample_rate(), semitones(base, key - 1), self.wave);
+                    osc.connect(Box::new(Envelope::new(self.sample_rate(), 0.1, 0.05, 0.8, 0.25)));
+                    osc.start();
+                    self.sounds.insert(key, Box::new(osc));
+                // }
+            },
+            Err(TryRecvError::Empty) => (),
+            Err(_) => panic!("synth control channel disconnected")
         }
 
-        let pos = self.ticks as f32 / self.rate as f32;
-        let val = f32::cos(pos * 2.0 * PI * self.freq as f32);
+        let mut sample = self.sounds.iter_mut().fold(0.0, |sample, (_, sound)| {
+            sample + sound.tick()
+        });
 
-        self.ticks += 1;
-        return val;
+        sample /= self.sounds.len() as f32;
+
+        Some(sample)
     }
 }
 
-struct Envelope {
-    ticks: u32,
-    state: EnvelopeState,
-    last_val: f32,
-
-    sustain: f32,
-    attack_samps: u32,
-    decay_samps: u32,
-    release_samps: u32,
-}
-
-#[derive(Debug)]
-enum EnvelopeState {
-    Idle,
-    Attack(f32),
-    Decay,
-    Sustain,
-    Release(f32),
-}
-
-impl Envelope {
-    fn new(rate: u32, attack: f32, decay: f32, sustain: f32, release: f32) -> Self {
-        return Envelope {
-            ticks: 0,
-            state: EnvelopeState::Idle,
-            last_val: 0.0,
-            sustain,
-            attack_samps: (attack * rate as f32) as u32,
-            decay_samps: (decay * rate as f32) as u32,
-            release_samps: (release * rate as f32) as u32,
-        };
+impl Source for Test {
+    fn current_frame_len(&self) -> Option<usize> {
+        return None
     }
 
-    fn tick(&mut self) -> f32 {
-        let val = match self.state {
-            EnvelopeState::Idle => {
-                self.ticks = 0;
-                0.0
-            }
-            EnvelopeState::Attack(start_val) => {
-                self.ticks += 1;
-
-                if self.ticks >= self.attack_samps {
-                    self.ticks = 0;
-                    self.state = EnvelopeState::Decay;
-                    1.0
-                } else {
-                    let pos = self.ticks as f32 / self.attack_samps as f32;
-                    pos * (1.0 - start_val) + start_val
-                }
-            }
-            EnvelopeState::Decay => {
-                self.ticks += 1;
-
-                if self.ticks >= self.decay_samps {
-                    self.ticks = 0;
-                    self.state = EnvelopeState::Sustain;
-                    return self.sustain;
-                }
-
-                let pos = self.ticks as f32 / self.decay_samps as f32;
-                1.0 - (pos * (1.0 - self.sustain))
-            }
-            EnvelopeState::Sustain => {
-                self.ticks = 0;
-                self.sustain
-            }
-            EnvelopeState::Release(start_val) => {
-                self.ticks += 1;
-
-                if self.ticks >= self.release_samps || start_val == 0.0 {
-                    self.state = EnvelopeState::Idle;
-                    0.0
-                } else {
-                    let pos = self.ticks as f32 / self.release_samps as f32;
-                    (1.0 - pos) * start_val
-                }
-            }
-        };
-
-        self.last_val = val;
-
-        return val;
+    fn sample_rate(&self) -> u32 {
+        48000
     }
 
-    fn press(&mut self) {
-        self.ticks = 0;
-        self.state = EnvelopeState::Attack(self.last_val);
+    fn channels(&self) -> u16 {
+        return 1
     }
 
-    fn release(&mut self) {
-        self.ticks = 0;
-        self.state = EnvelopeState::Release(self.last_val);
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        return None
     }
 }
